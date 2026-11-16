@@ -1,0 +1,17 @@
+# Python
+__pycache__/
+*.pyc
+
+# Experiment outputs
+outputs/*.pt
+outputs/*.csv
+
+# Assets (generated)
+assets/*.png
+assets/*.json
+
+# Secrets
+.env
+
+# Weights & Biases
+wandb/
