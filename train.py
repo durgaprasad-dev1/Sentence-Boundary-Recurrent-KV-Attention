@@ -40,16 +40,16 @@ def parse_args():
         help="Peak learning rate for AdamW (default: 3e-4)."
     )
     parser.add_argument(
-        "--seq_len", type=int, default=128,
-        help="Fixed sequence length to pack tokens into (default: 128)."
+        "--seq_len", type=int, default=256,
+        help="Fixed sequence length to pack tokens into (default: 256)."
     )
     parser.add_argument(
         "--epochs", type=int, default=3,
         help="Number of training epochs (default: 3)."
     )
     parser.add_argument(
-        "--max_steps", type=int, default=500,
-        help="Hard cap on total training steps (default: 500)."
+        "--max_steps", type=int, default=1500,
+        help="Hard cap on total training steps (default: 1500)."
     )
     parser.add_argument(
         "--dataset", choices=["tinystories", "wikitext"], default="tinystories",
@@ -272,21 +272,20 @@ def train(args):
     out_dir = Path(args.output_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
 
-    # -- Tokenizer -------------------------------------------------------
-    boundary_ids = [10, 11, 12]  # '.', '!', '?'
+    # -- Tokenizer & Model imports ---------------------------------------
+    script_dir = Path(__file__).parent
+    sys.path.insert(0, str(script_dir))
+    from model import GQATransformer, SBRTransformer, count_params, get_sentence_boundary_ids  # noqa: E402
+
+    boundary_ids = [10, 11, 12]  # fallback '.', '!', '?'
     try:
         from transformers import GPT2TokenizerFast
-        # Test if weights/vocab can be fetched quickly
         tokenizer = GPT2TokenizerFast.from_pretrained("gpt2", local_files_only=False)
         tokenizer.pad_token = tokenizer.eos_token
         vocab_size = tokenizer.vocab_size
-        period_toks = tokenizer.encode(".")
-        excl_toks = tokenizer.encode("!")
-        quest_toks = tokenizer.encode("?")
-        if period_toks: boundary_ids = [period_toks[0]]
-        if excl_toks: boundary_ids.append(excl_toks[0])
-        if quest_toks: boundary_ids.append(quest_toks[0])
+        boundary_ids = get_sentence_boundary_ids(tokenizer)
         print(f"[tokenizer] Loaded GPT-2 tokenizer (vocab_size={vocab_size:,})")
+        print(f"[tokenizer] Verified {len(boundary_ids)} sentence boundary token IDs in vocabulary.")
     except Exception as e:
         print(f"[tokenizer] Offline mode: using SimpleStoryTokenizer ({e})")
         tokenizer = SimpleStoryTokenizer(vocab_size=10000)
@@ -305,12 +304,25 @@ def train(args):
         num_workers=0, pin_memory=device.type == "cuda"
     )
 
-    # -- Model -----------------------------------------------------------
-    # Import from model.py in the same directory
-    script_dir = Path(__file__).parent
-    sys.path.insert(0, str(script_dir))
-    from model import GQATransformer, SBRTransformer, count_params  # noqa: E402
+    # Inspect decoded batch for sentence boundary verification
+    try:
+        sample_batch = next(iter(train_loader))[0][:1]
+        sample_tokens = sample_batch[0].tolist()
+        detected_bounds = []
+        for idx, t_id in enumerate(sample_tokens):
+            if t_id in boundary_ids:
+                try:
+                    dec = tokenizer.decode([t_id])
+                except Exception:
+                    dec = str(t_id)
+                detected_bounds.append((idx, t_id, repr(dec)))
+        print(f"[tokenizer] Sentence Boundary Verification on Sample Batch ({len(detected_bounds)} boundaries in {len(sample_tokens)} tokens):")
+        for pos, tid, dec_str in detected_bounds[:5]:
+            print(f"            - Pos {pos:>3}: Token ID {tid:>5} -> {dec_str}")
+    except Exception as e:
+        print(f"[tokenizer] Boundary inspection skipped: {e}")
 
+    # -- Model -----------------------------------------------------------
     model_cfg = dict(
         vocab_size=vocab_size,
         dim=256,
@@ -452,6 +464,24 @@ def train(args):
     print(f"| {'Final val loss':<{col_w - 2}} | {f'{final_val_loss:.4f}':<{col_w - 2}} |")
     print(f"| {'Avg tok/s':<{col_w - 2}} | {f'{avg_tps:,.1f}':<{col_w - 2}} |")
     print(sep + "\n")
+
+    # -- Qualitative Generation Samples --
+    print("\n" + "=" * 60)
+    print(f"Qualitative Generation Samples ({args.model.upper()})")
+    print("=" * 60)
+    sample_prompts = [
+        "Once upon a time, there was a little bird who",
+        "Lily was playing in the sunny garden when she found",
+        "The small dog loved to run, but suddenly",
+    ]
+    model.eval()
+    for prompt in sample_prompts:
+        prompt_ids = torch.tensor([tokenizer.encode(prompt)], dtype=torch.long, device=device)
+        gen_tokens = model.generate(prompt_ids, max_new_tokens=30, temperature=0.8, top_k=40)
+        decoded_output = tokenizer.decode(gen_tokens[0].tolist())
+        print(f"\n[Prompt]:    \"{prompt}\"")
+        print(f"[Generated]: \"{decoded_output.strip()}\"")
+    print("\n" + "=" * 60 + "\n")
 
     return final_val_loss, avg_tps
 

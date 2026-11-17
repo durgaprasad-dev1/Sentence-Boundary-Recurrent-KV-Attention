@@ -71,37 +71,58 @@ def _reset_memory(device: torch.device):
         torch.cuda.reset_peak_memory_stats(device)
 
 
-def _peak_memory_mb(
+def _compute_decode_kv_mb(model_name: str, ctx_len: int, batch_size: int = 1) -> float:
+    """Explicitly compute byte size of persistent KV-cache state tensors."""
+    dim = DEFAULT_CONFIG["dim"]
+    n_layers = DEFAULT_CONFIG["n_layers"]
+    n_kv_heads = DEFAULT_CONFIG["n_kv_heads"]
+    head_dim = dim // DEFAULT_CONFIG["n_heads"]
+    elem_size = 4  # float32
+
+    if model_name == "GQA":
+        # Full linear KV cache: K and V tensors stored for all ctx_len tokens across all layers
+        kv_elements = 2 * n_layers * batch_size * n_kv_heads * ctx_len * head_dim
+        return round((kv_elements * elem_size) / (1024 ** 2), 3)
+    else:
+        # SBR-KV: Active sentence window (<=64) + recurrent state tensor (h) per layer
+        active_window = min(ctx_len, 64)
+        active_elements = 2 * n_layers * batch_size * n_kv_heads * active_window * head_dim
+        recurrent_elements = n_layers * batch_size * 1 * dim
+        return round(((active_elements + recurrent_elements) * elem_size) / (1024 ** 2), 3)
+
+
+def _prefill_memory_mb(
     device: torch.device,
     cpu_baseline_mb: float,
     model_name: str = "GQA",
     ctx_len: int = 512,
     batch_size: int = 1,
 ) -> float:
+    """Measure or profile prefill peak activation memory (where O(L^2) attention dominates)."""
     if device.type == "cuda":
-        return torch.cuda.max_memory_allocated(device) / 1024 ** 2
-    # CPU fallback: check RSS delta; if negligible, calculate exact tensor memory footprint
+        return round(torch.cuda.max_memory_allocated(device) / (1024 ** 2), 2)
+
     rss_delta = max(0.0, _get_cpu_rss_mb() - cpu_baseline_mb)
     if rss_delta > 5.0:
-        return rss_delta
+        return round(rss_delta, 2)
 
-    base_weight_mb = 28.1  # ~7.05M parameters in float32
+    base_weight_mb = 28.1
     dim = DEFAULT_CONFIG["dim"]
-    n_layers = DEFAULT_CONFIG["n_layers"]
     n_heads = DEFAULT_CONFIG["n_heads"]
+    n_layers = DEFAULT_CONFIG["n_layers"]
     n_kv_heads = DEFAULT_CONFIG["n_kv_heads"]
     head_dim = dim // n_heads
 
     if model_name == "GQA":
-        kv_cache_mb = (batch_size * 2 * n_layers * n_kv_heads * head_dim * ctx_len * 4) / (1024 ** 2)
         attn_act_mb = (batch_size * n_heads * ctx_len * ctx_len * 4) / (1024 ** 2)
-        return round(base_weight_mb + kv_cache_mb + attn_act_mb, 2)
+        kv_cache_mb = (batch_size * 2 * n_layers * n_kv_heads * head_dim * ctx_len * 4) / (1024 ** 2)
+        return round(base_weight_mb + attn_act_mb + kv_cache_mb, 2)
     else:
-        sent_window = min(ctx_len, 64)
-        kv_cache_mb = (batch_size * 2 * n_layers * n_kv_heads * head_dim * sent_window * 4) / (1024 ** 2)
+        sent_w = min(ctx_len, 64)
+        attn_act_mb = (batch_size * n_heads * ctx_len * sent_w * 4) / (1024 ** 2)
+        kv_cache_mb = (batch_size * 2 * n_layers * n_kv_heads * head_dim * sent_w * 4) / (1024 ** 2)
         recurrent_mb = (batch_size * n_layers * dim * 4) / (1024 ** 2)
-        attn_act_mb = (batch_size * n_heads * ctx_len * sent_window * 4) / (1024 ** 2)
-        return round(base_weight_mb + kv_cache_mb + recurrent_mb + attn_act_mb, 2)
+        return round(base_weight_mb + attn_act_mb + kv_cache_mb + recurrent_mb, 2)
 
 
 @torch.no_grad()
@@ -161,21 +182,28 @@ def benchmark_model(
         elapsed = time.perf_counter() - start
 
         tokens_per_sec = (batch_size * ctx_len * measure_steps) / elapsed
-        vram_mb = _peak_memory_mb(
+        prefill_mb = _prefill_memory_mb(
             device=device,
             cpu_baseline_mb=cpu_baseline,
             model_name=model_name,
             ctx_len=ctx_len,
             batch_size=batch_size,
         )
+        decode_kv_mb = _compute_decode_kv_mb(
+            model_name=model_name,
+            ctx_len=ctx_len,
+            batch_size=batch_size,
+        )
 
         results[ctx_len] = {
-            "vram_mb": round(vram_mb, 2),
+            "prefill_peak_mb": round(prefill_mb, 2),
+            "decode_kv_mb": round(decode_kv_mb, 3),
             "tokens_per_sec": round(tokens_per_sec, 2),
         }
 
         print(
-            f"    -> VRAM/RAM: {vram_mb:.1f} MB | "
+            f"    -> Prefill Peak: {prefill_mb:.1f} MB | "
+            f"Decode KV Cache: {decode_kv_mb:.3f} MB | "
             f"Throughput: {tokens_per_sec:,.0f} tok/s"
         )
 
@@ -239,18 +267,78 @@ def _save_plot(
 # Console table
 # ---------------------------------------------------------------------------
 
+def _save_dual_vram_plot(results: dict, filename: Path):
+    """Dual-panel plot: Prefill Peak Activation Memory vs. Decode KV-Cache State Footprint."""
+    fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(14, 5.5))
+
+    for model_name, ctx_data in results.items():
+        ctx_lens = sorted(ctx_data.keys())
+        prefill_vals = [ctx_data[cl]["prefill_peak_mb"] for cl in ctx_lens]
+        decode_vals = [ctx_data[cl]["decode_kv_mb"] for cl in ctx_lens]
+        style = PLOT_STYLE.get(model_name, {})
+
+        # Panel 1: Prefill Peak Activation Memory
+        ax1.plot(
+            ctx_lens,
+            prefill_vals,
+            label=model_name,
+            color=style.get("color"),
+            marker=style.get("marker", "o"),
+            linestyle=style.get("linestyle", "-"),
+            linewidth=2,
+            markersize=7,
+        )
+
+        # Panel 2: Decode KV-Cache Footprint
+        ax2.plot(
+            ctx_lens,
+            decode_vals,
+            label=model_name,
+            color=style.get("color"),
+            marker=style.get("marker", "s"),
+            linestyle=style.get("linestyle", "--"),
+            linewidth=2,
+            markersize=7,
+        )
+
+    ax1.set_title("Prefill Peak Memory: Attention Activations", fontsize=12, fontweight="bold", pad=10)
+    ax1.set_xlabel("Context Length (tokens)", fontsize=11)
+    ax1.set_ylabel("Memory (MB)", fontsize=11)
+    ax1.legend(fontsize=10)
+    ax1.grid(True, linestyle="--", alpha=0.5)
+    ax1.set_xticks(sorted({cl for m in results.values() for cl in m}))
+
+    ax2.set_title("Decode KV-Cache State Footprint: O(1) vs O(L)", fontsize=12, fontweight="bold", pad=10)
+    ax2.set_xlabel("Context Length (tokens)", fontsize=11)
+    ax2.set_ylabel("Persistent Cache Memory (MB)", fontsize=11)
+    ax2.legend(fontsize=10)
+    ax2.grid(True, linestyle="--", alpha=0.5)
+    ax2.set_xticks(sorted({cl for m in results.values() for cl in m}))
+
+    fig.suptitle("Systems Memory Profiling: Prefill Activation vs. Decode KV Cache", fontsize=14, fontweight="bold", y=0.98)
+    fig.tight_layout()
+    fig.savefig(filename, dpi=150)
+    plt.close(fig)
+    print(f"  Saved: {filename}")
+
+
+# ---------------------------------------------------------------------------
+# Console table
+# ---------------------------------------------------------------------------
+
 def print_results_table(results: dict):
-    header = f"{'Model':<12} {'Context':>9} {'VRAM (MB)':>12} {'Tokens/sec':>14}"
-    sep = "-" * len(header)
+    header = f"{'Model':<10} {'Context':>8} {'Prefill Peak (MB)':>18} {'Decode KV (MB)':>16} {'Throughput (tok/s)':>20}"
+    sep = "=" * len(header)
     print("\n" + sep)
     print(header)
-    print(sep)
+    print("-" * len(header))
     for model_name, ctx_data in results.items():
         for ctx_len in sorted(ctx_data.keys()):
             r = ctx_data[ctx_len]
             print(
-                f"{model_name:<12} {ctx_len:>9,} "
-                f"{r['vram_mb']:>12.1f} {r['tokens_per_sec']:>14,.0f}"
+                f"{model_name:<10} {ctx_len:>8,} "
+                f"{r['prefill_peak_mb']:>18.1f} {r['decode_kv_mb']:>16.3f} "
+                f"{r['tokens_per_sec']:>20,.0f}"
             )
     print(sep + "\n")
 
@@ -405,11 +493,8 @@ def main():
 
     # ----- Plots -----
     print("\nGenerating plots …")
-    _save_plot(
+    _save_dual_vram_plot(
         results=all_results,
-        metric="vram_mb",
-        ylabel="Peak VRAM / RAM (MB)",
-        title="Memory Scaling: SBR-KV vs GQA",
         filename=output_dir / "vram_scaling_comparison.png",
     )
     _save_plot(

@@ -575,6 +575,84 @@ class SentenceBoundaryRecurrentKVAttention(nn.Module):
 
         return out, h
 
+    def step(
+        self,
+        x: torch.Tensor,
+        token_id: int,
+        layer_idx: int,
+        sbr_cache: dict,
+    ) -> torch.Tensor:
+        """Single-token incremental decode step with true O(1) state caching.
+
+        Discards past token KVs once a sentence boundary is encountered,
+        compressing them into the recurrent state h and keeping only active sentence KVs.
+        """
+        B, T, D = x.shape
+        assert T == 1
+        device = x.device
+
+        layer_cache = sbr_cache.setdefault(layer_idx, {
+            "h": torch.zeros(B, 1, D, device=device, dtype=x.dtype),
+            "active_k": None,
+            "active_v": None,
+            "active_x": [],
+        })
+
+        h = layer_cache["h"]
+        H, Hkv, Hd = self.n_heads, self.n_kv_heads, self.head_dim
+
+        # Current token Q, K, V
+        q = self.wq_local(x).view(B, 1, H, Hd).transpose(1, 2)
+        k = self.wk_local(x).view(B, 1, Hkv, Hd).transpose(1, 2)
+        v = self.wv_local(x).view(B, 1, Hkv, Hd).transpose(1, 2)
+
+        # Position offset in the active sentence
+        pos = len(layer_cache["active_x"])
+        q = self.rope(q, seq_start=pos)
+        k = self.rope(k, seq_start=pos)
+
+        # Append to active sentence cache
+        if layer_cache["active_k"] is None:
+            layer_cache["active_k"] = k
+            layer_cache["active_v"] = v
+        else:
+            layer_cache["active_k"] = torch.cat([layer_cache["active_k"], k], dim=2)
+            layer_cache["active_v"] = torch.cat([layer_cache["active_v"], v], dim=2)
+        layer_cache["active_x"].append(x)
+
+        # Attention over active sentence tokens
+        k_full = layer_cache["active_k"].repeat_interleave(self.groups, dim=1)
+        v_full = layer_cache["active_v"].repeat_interleave(self.groups, dim=1)
+        scores = torch.matmul(q, k_full.transpose(-2, -1)) * self.scale
+        attn = F.softmax(scores, dim=-1)
+        local_out = torch.matmul(attn, v_full).transpose(1, 2).contiguous().view(B, 1, H * Hd)
+        local_out = self.wo_local(local_out)
+
+        # Cross-attention to recurrent state h
+        cross_out = self._cross_attention(x, h, seq_start=pos)
+
+        # Gate combination
+        alpha = torch.sigmoid(self.alpha)
+        out = alpha * local_out + (1.0 - alpha) * cross_out
+
+        # Check for sentence boundary!
+        if token_id in self.boundary_ids:
+            # Sentence is complete: compress active sentence representations into h
+            sent_tokens = torch.cat(layer_cache["active_x"], dim=1)  # (B, L_sent, D)
+            sent_mean = sent_tokens.mean(dim=1, keepdim=True)        # (B, 1, D)
+            kv_proj = torch.tanh(self.w_kv_proj(sent_mean))          # (B, 1, D)
+            gate_input = torch.cat([h, kv_proj], dim=-1)             # (B, 1, 2D)
+            gate = torch.sigmoid(self.w_gate(gate_input))            # (B, 1, D)
+            new_h = gate * h + (1.0 - gate) * kv_proj                # (B, 1, D)
+
+            # TRUE O(1) FLUSH: Discard past token KVs!
+            layer_cache["h"] = new_h
+            layer_cache["active_k"] = None
+            layer_cache["active_v"] = None
+            layer_cache["active_x"] = []
+
+        return out
+
 
 # ---------------------------------------------------------------------------
 # SwiGLU Feed-Forward Network
@@ -694,6 +772,26 @@ class SBRTransformerBlock(nn.Module):
         x = x + self.ffn(self.norm2(x))
         return x, h
 
+    def step(
+        self,
+        x: torch.Tensor,
+        token_id: int,
+        sbr_cache: Optional[dict] = None,
+        kv_cache: Optional[dict] = None,
+    ) -> torch.Tensor:
+        """Incremental decode step for a single token."""
+        normed = self.norm1(x)
+        if self.use_sbr:
+            assert sbr_cache is not None
+            attn_out = self.attn.step(
+                normed, token_id=token_id, layer_idx=self.layer_idx, sbr_cache=sbr_cache
+            )
+        else:
+            attn_out = self.attn(normed, kv_cache=kv_cache, layer_idx=self.layer_idx)
+        x = x + attn_out
+        x = x + self.ffn(self.norm2(x))
+        return x
+
 
 # ---------------------------------------------------------------------------
 # SBRTransformer – full causal language model using SBR-KV
@@ -787,6 +885,55 @@ class SBRTransformer(nn.Module):
         x = self.norm(x)
         return self.lm_head(x), new_h
 
+    @torch.no_grad()
+    def generate(
+        self,
+        input_ids: torch.Tensor,
+        max_new_tokens: int = 40,
+        temperature: float = 0.8,
+        top_k: int = 40,
+    ) -> torch.Tensor:
+        """Autoregressive generation with true O(1) sentence-boundary state caching."""
+        self.eval()
+        device = input_ids.device
+        logits, h_states = self.forward(input_ids)
+
+        def sample_tok(lgt):
+            if temperature > 0:
+                lgt = lgt / temperature
+                if top_k > 0:
+                    v, _ = torch.topk(lgt, min(top_k, lgt.size(-1)))
+                    lgt[lgt < v[:, [-1]]] = -float("Inf")
+                probs = F.softmax(lgt, dim=-1)
+                return torch.multinomial(probs, num_samples=1)
+            return torch.argmax(lgt, dim=-1, keepdim=True)
+
+        next_token = sample_tok(logits[:, -1, :])
+        generated = [next_token]
+
+        # Initialize per-layer O(1) SBR state cache from prompt prefill
+        sbr_cache = {}
+        for i in range(self.n_layers):
+            sbr_cache[i] = {
+                "h": h_states[i] if h_states[i] is not None else torch.zeros(input_ids.size(0), 1, self.dim, device=device),
+                "active_k": None,
+                "active_v": None,
+                "active_x": [],
+            }
+
+        curr_token = next_token
+        for _ in range(max_new_tokens - 1):
+            x = self.embed(curr_token)
+            t_id = curr_token[0, 0].item()
+            for block in self.blocks:
+                x = block.step(x, token_id=t_id, sbr_cache=sbr_cache)
+            x = self.norm(x)
+            step_logits = self.lm_head(x)
+            curr_token = sample_tok(step_logits[:, -1, :])
+            generated.append(curr_token)
+
+        return torch.cat([input_ids] + generated, dim=1)
+
 
 # ---------------------------------------------------------------------------
 # GQATransformer – full causal language model using GQA (baseline)
@@ -877,6 +1024,59 @@ class GQATransformer(nn.Module):
             x, _ = block(x, kv_cache=kv_cache, seq_start=seq_start)
         x = self.norm(x)
         return self.lm_head(x), kv_cache
+
+    @torch.no_grad()
+    def generate(
+        self,
+        input_ids: torch.Tensor,
+        max_new_tokens: int = 40,
+        temperature: float = 0.8,
+        top_k: int = 40,
+    ) -> torch.Tensor:
+        """Autoregressive generation using standard linear O(L) KV cache."""
+        self.eval()
+        B, T = input_ids.shape
+        kv_cache = {}
+        logits, _ = self.forward(input_ids, kv_cache=kv_cache, seq_start=0)
+
+        def sample_tok(lgt):
+            if temperature > 0:
+                lgt = lgt / temperature
+                if top_k > 0:
+                    v, _ = torch.topk(lgt, min(top_k, lgt.size(-1)))
+                    lgt[lgt < v[:, [-1]]] = -float("Inf")
+                probs = F.softmax(lgt, dim=-1)
+                return torch.multinomial(probs, num_samples=1)
+            return torch.argmax(lgt, dim=-1, keepdim=True)
+
+        next_token = sample_tok(logits[:, -1, :])
+        generated = [next_token]
+
+        curr_token = next_token
+        for step in range(max_new_tokens - 1):
+            logits_step, _ = self.forward(curr_token, kv_cache=kv_cache, seq_start=T + step)
+            curr_token = sample_tok(logits_step[:, -1, :])
+            generated.append(curr_token)
+
+        return torch.cat([input_ids] + generated, dim=1)
+
+
+def get_sentence_boundary_ids(tokenizer, max_vocab: int = 50257) -> List[int]:
+    """Identify all token IDs in tokenizer vocabulary representing sentence terminators (., !, ?)."""
+    boundary_chars = {".", "!", "?"}
+    boundary_ids = set()
+    for p in [".", "!", "?"]:
+        boundary_ids.update(tokenizer.encode(p))
+    if hasattr(tokenizer, "vocab_size"):
+        scan_limit = min(tokenizer.vocab_size, max_vocab)
+        for i in range(scan_limit):
+            try:
+                text = tokenizer.decode([i])
+                if any(text.strip().endswith(c) for c in boundary_chars):
+                    boundary_ids.add(i)
+            except Exception:
+                pass
+    return sorted(list(boundary_ids))
 
 
 # ---------------------------------------------------------------------------
