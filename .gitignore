@@ -9,6 +9,8 @@ outputs/*.csv
 # Assets (generated)
 assets/*.png
 assets/*.json
+!assets/eval_results.json
+!assets/needle_recall_comparison.png
 
 # Secrets
 .env

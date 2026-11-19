@@ -126,17 +126,19 @@ Both models generated coherent multi-sentence continuations from identical promp
 
 ---
 
-### 4.3 Associative Recall Trade-Off & Gating Mechanism Ablation
+### 4.3 Synthetic Associative Recall
 
-While SBR-KV reduces memory by up to $62\times$, compressing completed sentences into recurrent vectors presents an honest scientific trade-off in fine-grained passkey retrieval:
+Each probe was trained for 300 steps on a synthetic task containing five key/value pairs. All probes use two layers with $d_{\text{model}}=128$ and were trained with batches of 32 at a context length of 128. Accuracy was measured on 100 independently generated trials at each evaluation length.
 
-| Mechanism / Architecture | 128 tokens | 256 tokens | 512 tokens | 1,024 tokens | Information Preservation Mechanism |
-|:---|:---:|:---:|:---:|:---:|:---|
-| **GQA Baseline (Full KV Cache)** | 100% | 100% | 100% | 100% | Stores uncompressed token history indefinitely |
-| **SBR-KV (Learned EMA Gate $\sigma(g_t)$)** | **84.0%** | **76.5%** | **68.0%** | **58.5%** | Input-dependent convex gating preserves salient sentence state |
-| **SBR-KV (Unweighted Mean Accumulator)** | 52.0% | 34.0% | 18.5% | 6.0% | Catastrophic signal dilution ($1/N$ decay over sentences) |
+| Probe variant | 128 tokens | 256 tokens | 512 tokens | 1,024 tokens |
+|:---|---:|---:|---:|---:|
+| GQA Baseline | 17% | 21% | 20% | 18% |
+| SBR-KV with Learned EMA Gate | 18% | 25% | 18% | 17% |
+| SBR-KV with Unweighted Mean | 29% | 25% | 19% | 28% |
 
-> **Key Finding**: SBR-KV trades exact token-level passkey memorization for order-of-magnitude memory savings. Crucially, the **learned EMA gate ($\sigma(g_t)$) is essential**: it prevents catastrophic forgetting, preserving **$>3\times$ more signal** than unweighted sentence averaging at $L=1024$.
+There are 40 possible answer classes, giving a uniform-random reference accuracy of 2.5%. These results are point estimates from 100 trials per context length; they do not establish a consistent ranking among the three probes. This synthetic probe evaluation is separate from the full-model memory and throughput benchmarks above.
+
+The measurements are stored in [`assets/eval_results.json`](assets/eval_results.json), and the plot is [`assets/needle_recall_comparison.png`](assets/needle_recall_comparison.png). Reproduce both with `python evaluate.py`.
 
 ---
 
@@ -151,8 +153,8 @@ While SBR-KV reduces memory by up to $62\times$, compressing completed sentences
 #### Training & Validation Loss Convergence
 ![Loss Convergence](assets/loss_convergence.png)
 
-#### Associative Recall & Needle-in-a-Haystack Profile
-![Needle Recall Comparison](assets/needle_recall_comparison.png)
+#### Synthetic Associative Recall Probe Accuracy
+![Associative Recall Comparison](assets/needle_recall_comparison.png)
 
 ---
 
@@ -166,7 +168,7 @@ While SBR-KV reduces memory by up to $62\times$, compressing completed sentences
 │                         # sentence boundary verification, CSV logging, and checkpointing
 ├── benchmark.py          # Systems ML profiling script measuring prefill activation peak,
 │                         # decode KV tensor bytes, throughput, and generating plots
-├── evaluate.py           # Synthetic associative recall & needle-in-a-haystack verification
+├── evaluate.py           # Trains and evaluates synthetic associative-recall probes
 ├── requirements.txt      # Pinned dependencies (torch, transformers, datasets, matplotlib, psutil)
 ├── assets/               # Generated benchmark plots & JSON metrics
 │   ├── benchmark_results.json
